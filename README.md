@@ -7,14 +7,9 @@ Legal use only: use on systems you own or have explicit permission to test.
 A fast, multi-technique XPath injection vulnerability scanner written in Nim.
 Zero external dependencies beyond the Nim standard library.
 
-```
-  ██╗  ██╗██████╗  █████╗ ████████╗██╗  ██╗
-  ╚██╗██╔╝██╔══██╗██╔══██╗╚══██╔══╝██║  ██║
-   ╚███╔╝ ██████╔╝███████║   ██║   ███████║
-   ██╔██╗ ██╔═══╝ ██╔══██║   ██║   ██╔══██║
-  ██╔╝ ██╗██║     ██║  ██║   ██║   ██║  ██║
-  ╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝
-```
+<img width="1024" height="243" alt="xpath" src="https://github.com/user-attachments/assets/2b6ed396-4048-4b47-8003-921cd53ec0a3" />
+
+
 
 ## Features
 
