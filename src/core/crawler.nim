@@ -7,13 +7,13 @@
 ## Parses raw HTML to extract <form> elements and their fields,
 ## resolves relative action URLs, and returns ready-to-scan targets.
 
-import strutils, uri, tables
+import strutils, uri, htmlparser, xmltree, strtabs
 import ../utils/config, ../utils/logger
 
 type
   FieldKind* = enum
     fkText, fkPassword, fkHidden, fkSearch,
-    fkTextarea, fkSelect, fkOther
+    fkTextarea, fkSelect, fkRadio, fkCheckbox, fkOther
 
   FormField* = object
     name*:  string
@@ -27,73 +27,19 @@ type
     raw*:        string
 
 
-proc extractAttr(tag, attr: string): string =
-  let needle = attr & "="
-  var i = tag.toLowerAscii().find(needle)
-  if i < 0: return ""
-  i += needle.len
-  if i >= tag.len: return ""
-  let q = tag[i]
-  if q == '"' or q == '\'':
-    let close = tag.find(q, i + 1)
-    if close < 0: return tag[i+1..^1]
-    return tag[i+1..<close]
+proc attrValue(node: XmlNode, name: string): string =
+  result = node.attr(name)
+
+proc hasAttribute(node: XmlNode, name: string): bool =
+  node.kind == xnElement and node.attrs != nil and node.attrs.hasKey(name)
+
+proc nodeText(node: XmlNode): string =
+  case node.kind
+  of xnText, xnVerbatimText, xnCData, xnEntity:
+    result.add(node.text)
   else:
-    var j = i
-    while j < tag.len and tag[j] notin {' ', '\t', '\n', '\r', '>'}:
-      inc j
-    return tag[i..<j]
-
-proc hasAttr(tag, attr: string): bool =
-  tag.toLowerAscii().contains(attr & "=") or
-  tag.toLowerAscii().contains(" " & attr & " ") or
-  tag.toLowerAscii().contains(" " & attr & ">")
-
-proc tagName(tag: string): string =
-  var i = 0
-  while i < tag.len and tag[i] in {'<', '/'}: inc i
-  var j = i
-  while j < tag.len and tag[j] notin {' ', '\t', '\n', '\r', '>', '/'}:
-    inc j
-  result = tag[i..<j].toLowerAscii()
-
-
-iterator tags(html: string): tuple[tag: string, pos: int] =
-  var i = 0
-  while i < html.len:
-    if html[i] == '<':
-      if i + 3 < html.len and html[i+1..i+3] == "!--":
-        let close = html.find("-->", i + 3)
-        i = if close < 0: html.len else: close + 3
-        continue
-      let nameStart = i + 1
-      var ni = nameStart
-      while ni < html.len and html[ni] notin {' ', '\t', '\n', '\r', '>', '/'}:
-        inc ni
-      let tn = html[nameStart..<ni].toLowerAscii()
-      if tn == "script" or tn == "style":
-        let closeTag = "</" & tn & ">"
-        let close = html.toLowerAscii().find(closeTag, i + 1)
-        i = if close < 0: html.len else: close + closeTag.len
-        continue
-      var j = i + 1
-      var inQ = '\0'
-      while j < html.len:
-        let ch = html[j]
-        if inQ != '\0':
-          if ch == inQ: inQ = '\0'
-        elif ch == '"' or ch == '\'':
-          inQ = ch
-        elif ch == '>':
-          break
-        inc j
-      if j < html.len:
-        yield (html[i..j], i)
-        i = j + 1
-      else:
-        break
-    else:
-      inc i
+    for child in node.items:
+      result.add(nodeText(child))
 
 
 proc resolveUrl*(base, href: string): string =
@@ -121,64 +67,79 @@ proc fieldKindOf(typeAttr: string): FieldKind =
   of "password":        fkPassword
   of "hidden":          fkHidden
   of "search":          fkSearch
+  of "radio":           fkRadio
+  of "checkbox":        fkCheckbox
   of "text", "email",
      "tel", "number",
      "url", "":         fkText
+  of "submit", "button",
+     "reset", "image",
+     "file":            fkOther
   else:                 fkOther
 
+proc selectedValue(selectNode: XmlNode): string =
+  var firstValue = ""
+  for option in selectNode.findAll("option", caseInsensitive = true):
+    let value = block:
+      let attr = option.attrValue("value")
+      if attr.len > 0: attr else: option.nodeText().strip()
+    if firstValue.len == 0:
+      firstValue = value
+    if option.hasAttribute("selected"):
+      return value
+  result = firstValue
+
+proc formFieldNodes(formNode: XmlNode): seq[XmlNode] =
+  for child in formNode.findAll("input", caseInsensitive = true):
+    result.add(child)
+  for child in formNode.findAll("textarea", caseInsensitive = true):
+    result.add(child)
+  for child in formNode.findAll("select", caseInsensitive = true):
+    result.add(child)
+
 proc crawlForms*(html, pageUrl: string): seq[DetectedForm] =
-  var
-    inForm   = false
-    curForm  = DetectedForm()
-    formBuf  = ""
+  let doc = parseHtml(html)
+  for formNode in doc.findAll("form", caseInsensitive = true):
+    let action = formNode.attrValue("action")
+    let meth = formNode.attrValue("method").toUpperAscii()
+    var form = DetectedForm(
+      action: resolveUrl(pageUrl, action),
+      httpMethod: if meth == "POST": hmPost else: hmGet,
+      raw: $formNode
+    )
 
-  for (tag, _) in tags(html):
-    let tn = tagName(tag)
+    for fieldNode in formNode.formFieldNodes():
+      let name = fieldNode.attrValue("name")
+      if name.len == 0:
+        continue
 
-    case tn
-    of "form":
-      if tag.startsWith("</"):
-        if inForm:
-          result.add(curForm)
-          curForm  = DetectedForm()
-          inForm   = false
-          formBuf  = ""
+      case fieldNode.tag.toLowerAscii()
+      of "input":
+        let kind = fieldKindOf(fieldNode.attrValue("type"))
+        if kind == fkOther:
+          continue
+        form.fields.add(FormField(
+          name: name,
+          kind: kind,
+          value: fieldNode.attrValue("value")
+        ))
+      of "textarea":
+        form.fields.add(FormField(
+          name: name,
+          kind: fkTextarea,
+          value: fieldNode.nodeText()
+        ))
+      of "select":
+        form.fields.add(FormField(
+          name: name,
+          kind: fkSelect,
+          value: fieldNode.selectedValue()
+        ))
       else:
-        inForm = true
-        let action = extractAttr(tag, "action")
-        let meth   = extractAttr(tag, "method").toUpperAscii()
-        curForm = DetectedForm(
-          action:     resolveUrl(pageUrl, action),
-          httpMethod: if meth == "POST": hmPost else: hmGet,
-          raw:        tag
-        )
+        discard
 
-    of "input":
-      if not inForm: continue
-      let name = extractAttr(tag, "name")
-      if name.len == 0: continue
-      let typeAttr = extractAttr(tag, "type")
-      let kind     = fieldKindOf(typeAttr)
-      if kind == fkOther: continue
-      let value = extractAttr(tag, "value")
-      curForm.fields.add(FormField(name: name, kind: kind, value: value))
-
-    of "textarea":
-      if not inForm: continue
-      let name = extractAttr(tag, "name")
-      if name.len == 0: continue
-      curForm.fields.add(FormField(name: name, kind: fkTextarea, value: ""))
-
-    of "select":
-      if not inForm: continue
-      let name = extractAttr(tag, "name")
-      if name.len == 0: continue
-      curForm.fields.add(FormField(name: name, kind: fkSelect, value: "1"))
-
-    else: discard
-
-  if inForm and curForm.fields.len > 0:
-    result.add(curForm)
+    if form.fields.len > 0:
+      result.add(form)
 
 proc printForms*(forms: seq[DetectedForm]) =
   if forms.len == 0:
@@ -194,22 +155,32 @@ proc printForms*(forms: seq[DetectedForm]) =
         of fkSearch:   " [search]"
         of fkTextarea: " [textarea]"
         of fkSelect:   " [select]"
+        of fkRadio:    " [radio]"
+        of fkCheckbox: " [checkbox]"
         else:          ""
       info("    param: " & field.name & kindStr)
+
+proc formParts(form: DetectedForm, injectParam: string,
+               injectValue: string): seq[(string, string)] =
+  var seen: seq[string]
+  for f in form.fields:
+    if f.name in seen:
+      continue
+    seen.add(f.name)
+    let v = if f.name == injectParam: injectValue else: f.value
+    result.add((f.name, v))
 
 proc formToPostBody*(form: DetectedForm, injectParam: string,
                      injectValue: string): string =
   var parts: seq[string]
-  for f in form.fields:
-    let v = if f.name == injectParam: injectValue else: f.value
-    parts.add(encodeUrl(f.name) & "=" & encodeUrl(v))
+  for (name, value) in form.formParts(injectParam, injectValue):
+    parts.add(encodeUrl(name) & "=" & encodeUrl(value))
   result = parts.join("&")
 
 proc formToGetUrl*(form: DetectedForm, injectParam: string,
                    injectValue: string): string =
   var parts: seq[string]
-  for f in form.fields:
-    let v = if f.name == injectParam: injectValue else: f.value
-    parts.add(encodeUrl(f.name) & "=" & encodeUrl(v))
+  for (name, value) in form.formParts(injectParam, injectValue):
+    parts.add(encodeUrl(name) & "=" & encodeUrl(value))
   let sep = if '?' in form.action: "&" else: "?"
   result = form.action & sep & parts.join("&")

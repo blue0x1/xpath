@@ -15,6 +15,24 @@ type
     err*:        string
     size*:       int
 
+var sharedSslContext: SslContext
+var lastRequestAt = 0.0
+
+proc tlsContext(): SslContext =
+  if sharedSslContext.isNil:
+    sharedSslContext = newContext(verifyMode = CVerifyNone)
+  result = sharedSslContext
+
+proc enforceDelay(cfg: ScanConfig) =
+  if cfg.delay <= 0:
+    return
+  let minGap = cfg.delay.float / 1000.0
+  let now = epochTime()
+  let waitFor = (lastRequestAt + minGap) - now
+  if waitFor > 0:
+    os.sleep(max(1, int(waitFor * 1000.0)))
+  lastRequestAt = epochTime()
+
 proc looksEncoded*(s: string): bool =
   var i = 0
   while i + 2 < s.len:
@@ -66,9 +84,11 @@ proc sendRequest*(cfg: ScanConfig,
                   extraHeaders: seq[(string, string)] = @[]): HttpResponse =
   let targetUrl = if urlOverride.len > 0: urlOverride else: cfg.url
 
+  enforceDelay(cfg)
+
   var client: HttpClient
   try:
-    let tlsCtx = newContext(verifyMode = CVerifyNone)
+    let tlsCtx = tlsContext()
     let redirects = if cfg.followRedirects: 5 else: 0
     if cfg.proxy.len > 0:
       client = newHttpClient(
@@ -137,8 +157,6 @@ proc sendRequest*(cfg: ScanConfig,
   finally:
     client.close()
 
-  if cfg.delay > 0:
-    os.sleep(cfg.delay)
 
 proc sendRequestWithRetry*(cfg: ScanConfig,
                            urlOverride: string = "",

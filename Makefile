@@ -12,6 +12,7 @@ SRC := src/xpath.nim
 BUILD_DIR := build
 DIST_DIR := dist
 NIMCACHE := $(BUILD_DIR)/nimcache
+TEST_NIMCACHE := $(BUILD_DIR)/test-nimcache
 NIMFLAGS := -d:ssl -d:release --nimcache:$(NIMCACHE)
 MINGW_CC ?= x86_64-w64-mingw32-gcc
 LINUX_BIN := $(DIST_DIR)/$(APP)-linux-$(ARCH)
@@ -19,7 +20,7 @@ WINDOWS_BIN := $(DIST_DIR)/$(APP)-windows-$(ARCH).exe
 DEB_ROOT := $(BUILD_DIR)/deb/$(APP)_$(VERSION)_$(ARCH)
 DEB_FILE := $(DIST_DIR)/$(APP)_$(VERSION)_$(ARCH).deb
 
-.PHONY: all linux windows install uninstall deb clean
+.PHONY: all linux windows test install uninstall deb clean
 
 all: linux
 
@@ -35,6 +36,9 @@ linux: $(DIST_DIR) $(BUILD_DIR)
 windows: $(DIST_DIR) $(BUILD_DIR)
 	@command -v $(MINGW_CC) >/dev/null 2>&1 || { echo "Missing Windows cross compiler: $(MINGW_CC)"; echo "Install mingw-w64 or set MINGW_CC=/path/to/x86_64-w64-mingw32-gcc"; exit 1; }
 	nim c $(NIMFLAGS) --os:windows --cpu:amd64 --cc:gcc --gcc.exe:$(MINGW_CC) --gcc.linkerexe:$(MINGW_CC) -o:$(WINDOWS_BIN) $(SRC)
+
+test: $(BUILD_DIR)
+	nim c -r -d:ssl --nimcache:$(TEST_NIMCACHE) -o:$(BUILD_DIR)/test_all tests/test_all.nim
 
 install: linux
 	install -Dm755 $(LINUX_BIN) $(DESTDIR)$(BINDIR)/$(APP)

@@ -153,35 +153,42 @@ proc printExtractionResult*(er: ExtractionResult) =
 proc toJsonScan*(res: ScanResult): JsonNode =
   var vulnArr = newJArray()
   for v in res.vulns:
-    vulnArr.add(%*{
-      "type":        $v.vulnType,
-      "parameter":   v.parameter,
-      "payload":     v.payload,
-      "confidence":  v.confidence,
-      "evidence":    v.evidence,
-      "diff_context": v.diffContext
-    })
-  result = %*{
-    "scanner":    "xpath v1.0.0",
-    "timestamp":  now().format("yyyy-MM-dd'T'HH:mm:ss"),
-    "target":     res.target,
-    "params":     res.testedParams,
-    "requests":   res.requestCount,
-    "duration":   res.duration,
-    "vuln_count": res.vulns.len,
-    "vulnerabilities": vulnArr
-  }
+    var obj = newJObject()
+    obj["type"] = %($v.vulnType)
+    obj["parameter"] = %(v.parameter)
+    obj["payload"] = %(v.payload)
+    obj["confidence"] = %(v.confidence)
+    obj["evidence"] = %(v.evidence)
+    obj["diff_context"] = %(v.diffContext)
+    vulnArr.add(obj)
+
+  var paramsArr = newJArray()
+  for param in res.testedParams:
+    paramsArr.add(%param)
+
+  result = newJObject()
+  result["scanner"] = %"xpath v1.0.0"
+  result["timestamp"] = %(now().format("yyyy-MM-dd'T'HH:mm:ss"))
+  result["target"] = %(res.target)
+  result["params"] = paramsArr
+  result["requests"] = %(res.requestCount)
+  result["duration"] = %(res.duration)
+  result["vuln_count"] = %(res.vulns.len)
+  result["vulnerabilities"] = vulnArr
 
 proc toJsonExtract*(er: ExtractionResult): JsonNode =
   var nodesArr = newJArray()
   for (name, val) in er.nodes:
-    nodesArr.add(%*{"name": name, "value": val})
-  result = %*{
-    "expression": er.expr,
-    "node_count": er.nodeCount,
-    "nodes":      nodesArr,
-    "value":      er.value
-  }
+    var obj = newJObject()
+    obj["name"] = %(name)
+    obj["value"] = %(val)
+    nodesArr.add(obj)
+
+  result = newJObject()
+  result["expression"] = %(er.expr)
+  result["node_count"] = %(er.nodeCount)
+  result["nodes"] = nodesArr
+  result["value"] = %(er.value)
 
 proc saveReport*(scanResult: ScanResult,
                  extractResult: ExtractionResult,
@@ -190,7 +197,8 @@ proc saveReport*(scanResult: ScanResult,
 
   var content = ""
   if cfg.outputFormat == fmtJson:
-    var root = %*{"scan": toJsonScan(scanResult)}
+    var root = newJObject()
+    root["scan"] = toJsonScan(scanResult)
     if extractResult.expr.len > 0:
       root["extraction"] = toJsonExtract(extractResult)
     content = root.pretty()

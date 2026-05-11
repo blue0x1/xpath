@@ -16,6 +16,7 @@ import http, analyzer, payloads
 
 const
   PRINTABLE_ASCII* = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+  COMMON_UTF8* = "áàâäãåāăąæçćčďđéèêëēėęíìîïīłñńóòôöõøōœŕřśšșßťțúùûüūýÿžźżÁÀÂÄÃÅĀĂĄÆÇĆČĎĐÉÈÊËĒĖĘÍÌÎÏĪŁÑŃÓÒÔÖÕØŌŒŔŘŚŠȘẞŤȚÚÙÛÜŪÝŸŽŹŻαβγδεζηθικλμνξοπρστυφχψωабвгдеёжзийклмнопрстуфхцчшщъыьэюяابتثجحخدذرزسشصضطظعغفقكلمنهوي"
   ALPHA_NUMERIC*   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
 
 type
@@ -78,21 +79,59 @@ proc extractCount*(ctx: var ExtractContext, expr: string, maxN = 1000): int =
       hi = mid - 1
   result = lo
 
+proc xpathLiteral(value: string): string =
+  if "'" notin value:
+    return "'" & value & "'"
+  if "\"" notin value:
+    return "\"" & value & "\""
+  result = "concat("
+  let parts = value.split("'")
+  for i in 0 ..< parts.len:
+    if i > 0:
+      result.add(", \"'\", ")
+    result.add("'" & parts[i] & "'")
+  result.add(")")
+
+proc utf8Chars(s: string): seq[string] =
+  var i = 0
+  while i < s.len:
+    let b = ord(s[i])
+    var size =
+      if b < 0x80: 1
+      elif (b and 0xE0) == 0xC0: 2
+      elif (b and 0xF0) == 0xE0: 3
+      elif (b and 0xF8) == 0xF0: 4
+      else: 1
+    if i + size > s.len:
+      size = 1
+    result.add(s[i ..< i + size])
+    i += size
+
+proc charEquals(ctx: var ExtractContext, expr: string, pos: int,
+                candidate: string): bool =
+  ctx.isTrue(ctx.cond("substring(" & expr & "," & $pos & ",1)=" &
+                      xpathLiteral(candidate)))
+
 proc extractChar*(ctx: var ExtractContext, expr: string, pos: int,
-                  charset = PRINTABLE_ASCII): char =
+                  charset = PRINTABLE_ASCII): string =
   var lo = 0
   var hi = charset.len - 1
   while lo < hi:
     let mid = (lo + hi + 1) div 2
-    if ctx.isTrue(ctx.cond("substring(" & expr & "," & $pos & ",1)>='" & $charset[mid] & "'")):
+    if ctx.isTrue(ctx.cond("substring(" & expr & "," & $pos & ",1)>=" &
+                           xpathLiteral($charset[mid]))):
       lo = mid
     else:
       hi = mid - 1
-  let candidate = charset[lo]
-  if ctx.isTrue(ctx.cond("substring(" & expr & "," & $pos & ",1)='" & $candidate & "'")):
-    result = candidate
-  else:
-    result = '\0'
+  let candidate = $charset[lo]
+  if ctx.charEquals(expr, pos, candidate):
+    return candidate
+
+  for ch in utf8Chars(COMMON_UTF8):
+    if ctx.charEquals(expr, pos, ch):
+      return ch
+
+  result = ""
 
 proc extractString*(ctx: var ExtractContext, expr: string,
                     maxLen = 256, charset = PRINTABLE_ASCII): string =
@@ -104,8 +143,8 @@ proc extractString*(ctx: var ExtractContext, expr: string,
   var buf = ""
   for i in 1..length:
     let ch = extractChar(ctx, expr, i, charset)
-    if ch == '\0':
-      debug("    Null char at pos " & $i & " - stopping")
+    if ch.len == 0:
+      debug("    Unknown char at pos " & $i & " - stopping")
       break
     buf.add(ch)
     stdout.write(ch)
@@ -147,20 +186,31 @@ proc extractAtPosition*(ctx: var ExtractContext, pos: int, fieldExpr: string,
     while clo < chi:
       let mid = (clo + chi + 1) div 2
       if ctx.isTrue(ctx.cond("position()=" & $pos &
-                               " and substring(" & fieldExpr & "," & $i & ",1)>='" &
-                               $PRINTABLE_ASCII[mid] & "'")):
+                               " and substring(" & fieldExpr & "," & $i & ",1)>=" &
+                               xpathLiteral($PRINTABLE_ASCII[mid]))):
         clo = mid
       else:
         chi = mid - 1
-    let candidate = PRINTABLE_ASCII[clo]
+    let candidate = $PRINTABLE_ASCII[clo]
     if ctx.isTrue(ctx.cond("position()=" & $pos &
-                             " and substring(" & fieldExpr & "," & $i & ",1)='" &
-                             $candidate & "'")):
+                             " and substring(" & fieldExpr & "," & $i & ",1)=" &
+                             xpathLiteral(candidate))):
       buf.add(candidate)
       stdout.write(candidate)
       stdout.flushFile()
     else:
-      break
+      var found = ""
+      for ch in utf8Chars(COMMON_UTF8):
+        if ctx.isTrue(ctx.cond("position()=" & $pos &
+                               " and substring(" & fieldExpr & "," & $i & ",1)=" &
+                               xpathLiteral(ch))):
+          found = ch
+          break
+      if found.len == 0:
+        break
+      buf.add(found)
+      stdout.write(found)
+      stdout.flushFile()
   echo ""
   result = buf
 
@@ -432,12 +482,6 @@ proc isNoiseVisibleLine*(line: string): bool =
   let low = line.toLowerAscii().strip()
   if low.len == 0:
     return true
-  if low == "no results!" or low == "no results" or low == "nothing":
-    return true
-  if low == "results:" or low == "results" or low == "download":
-    return true
-  if low == "name access created at download":
-    return true
   if "internal server error" in low:
     return true
   if low.startsWith("xpath:") or low.startsWith("query:"):
@@ -465,13 +509,149 @@ proc normalizedLines(s: string): seq[string] =
     if line.len > 0 and not isNoiseVisibleLine(line):
       result.add(line)
 
+proc extractHtmlTableRowsDetailed*(body: string): seq[string]
+
+proc visibleTextItems(body: string): seq[string] =
+  result = extractHtmlTableRowsDetailed(body)
+  if result.len == 0:
+    result = normalizedLines(body)
+
+proc uniqueVisibleItems(items: seq[string]): seq[string] =
+  for item in items:
+    if item.len > 0 and item notin result:
+      result.add(item)
+
+proc isHexToken(s: string): bool =
+  if s.len < 32:
+    return false
+  for ch in s:
+    if ch notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+      return false
+  result = s.len in [32, 40, 64, 96, 128] or s.len >= 48
+
+proc hasAlphaDigit(s: string): bool =
+  var hasAlpha = false
+  var hasDigit = false
+  for ch in s:
+    if ch in {'a'..'z', 'A'..'Z'}:
+      hasAlpha = true
+    elif ch in {'0'..'9'}:
+      hasDigit = true
+  result = hasAlpha and hasDigit
+
+proc isCompactToken(s: string): bool =
+  if s.len < 20 or s.len > 160 or not hasAlphaDigit(s):
+    return false
+  for ch in s:
+    if ch in {' ', '\t', '\r', '\n'}:
+      return false
+  result = true
+
+proc isBraceToken(s: string): bool =
+  let openAt = s.find('{')
+  let closeAt = s.rfind('}')
+  result = openAt >= 0 and closeAt > openAt + 4 and s.len <= 200
+
+proc cleanVisibleToken(s: string): string =
+  result = s.strip(chars = {' ', '\t', '\r', '\n', '"', '\'', ',', ';', ':',
+                            '(', ')', '[', ']', '<', '>'})
+
+proc tokensFromLine(line: string): seq[string] =
+  for raw in line.splitWhitespace():
+    let token = cleanVisibleToken(raw)
+    if token.len > 0:
+      result.add(token)
+
+proc interestingKind(line: string): string =
+  if isBraceToken(line):
+    return "brace"
+  for token in tokensFromLine(line):
+    if isBraceToken(token):
+      return "brace"
+    if isHexToken(token):
+      return "hash"
+    if isCompactToken(token):
+      return "token"
+  result = ""
+
+proc interestingVisibleNodes(items: seq[string],
+                             labelPrefix = "item",
+                             maxContexts = 20,
+                             maxSignals = 40): seq[(string, string)] =
+  let uniqueItems = uniqueVisibleItems(items)
+  var contexts: seq[string]
+  var tokenCount = 0
+  var hashCount = 0
+  var signals = 0
+
+  for wanted in ["brace", "hash", "token"]:
+    if signals >= maxSignals:
+      break
+
+    for i, item in uniqueItems:
+      if signals >= maxSignals:
+        break
+
+      let kind = interestingKind(item)
+      if kind != wanted:
+        continue
+
+      if kind == "hash":
+        inc hashCount
+        result.add((labelPrefix & "-hash[" & $hashCount & "]", item))
+      else:
+        inc tokenCount
+        result.add((labelPrefix & "-token[" & $tokenCount & "]", item))
+      inc signals
+
+      let lo = max(0, i - 3)
+      let hi = min(uniqueItems.len - 1, i + 3)
+      let context = uniqueItems[lo .. hi].join(" | ")
+      if context notin contexts and contexts.len < maxContexts:
+        contexts.add(context)
+        result.add((labelPrefix & "-context[" & $contexts.len & "]", context))
+
+proc newVisibleItems(baseline, injected: string): seq[string] =
+  let baseLines = uniqueVisibleItems(visibleTextItems(baseline))
+  for line in visibleTextItems(injected):
+    if line notin baseLines and line notin result:
+      result.add(line)
+
+proc visibleDeltaNodes(baseline, injected, labelPrefix: string): seq[(string, string)] =
+  let items = newVisibleItems(baseline, injected)
+  result = interestingVisibleNodes(items, labelPrefix)
+
+proc payloadLabel(selector, path: string): string =
+  selector & "|" & path
+
+proc appendVisibleItems(er: var ExtractionResult,
+                        items: seq[string],
+                        labelPrefix: string,
+                        maxItems = 120) =
+  let highlights = interestingVisibleNodes(items, labelPrefix)
+  let chosen =
+    if highlights.len > 0: highlights
+    else:
+      var limited: seq[(string, string)]
+      let uniqueItems = uniqueVisibleItems(items)
+      for i in 0 ..< min(uniqueItems.len, maxItems):
+        limited.add((labelPrefix & "[" & $(i + 1) & "]", uniqueItems[i]))
+      limited
+
+  for node in chosen:
+    er.nodes.add(node)
+    er.nodeCount = er.nodes.len
+    finding(node[0], node[1])
+
 proc visibleDelta*(baseline, injected: string): string =
-  let baseLines = normalizedLines(baseline)
-  let injLines = normalizedLines(injected)
-  var unique: seq[string]
-  for line in injLines:
-    if line notin baseLines and line notin unique:
-      unique.add(line)
+  let unique = newVisibleItems(baseline, injected)
+  let highlights = interestingVisibleNodes(unique, "delta")
+  if highlights.len > 0:
+    var values: seq[string]
+    for node in highlights:
+      if node[1] notin values:
+        values.add(node[1])
+    return values.join(" | ")
 
   var filtered: seq[string]
   for line in unique:
@@ -483,7 +663,8 @@ proc visibleDelta*(baseline, injected: string): string =
     if item.len > 0:
       filtered.add(item)
 
-  result = filtered.join(" | ")
+  if filtered.len > 0:
+    result = filtered[0 ..< min(filtered.len, 120)].join(" | ")
 
 proc compactVisibleText(s: string): string =
   for part in stripTags(s).splitWhitespace():
@@ -505,8 +686,11 @@ proc extractHtmlRows(body: string): seq[string] =
     if stop < 0:
       break
     let chunk = body[gt + 1 ..< stop]
+    if "<th" in chunk.toLowerAscii():
+      pos = stop + 5
+      continue
     let text = compactVisibleText(chunk)
-    if text.len > 0 and text.toLowerAscii() notin ["actions", "name date type"]:
+    if text.len > 0:
       result.add(text)
     pos = stop + 5
 
@@ -562,6 +746,9 @@ proc extractHtmlTableRowsDetailed*(body: string): seq[string] =
     if stop < 0:
       break
     let rowHtml = body[gt + 1 ..< stop]
+    if "<th" in rowHtml.toLowerAscii():
+      pos = stop + 5
+      continue
     var text = compactVisibleText(rowHtml)
     for href in extractLinksFromRow(rowHtml):
       if href notin text:
@@ -574,24 +761,10 @@ proc extractHtmlTableRowsDetailed*(body: string): seq[string] =
 
 proc extractVisibleHtmlResponse*(body: string, labelPrefix = "row"): ExtractionResult =
   result.expr = "visible html response"
-  var rows = extractHtmlTableRowsDetailed(body)
-  if rows.len == 0:
-    rows = normalizedLines(body)
-
-  var seen: seq[string]
-  for row in rows:
-    let low = row.toLowerAscii()
-    if row in seen:
-      continue
-    if low == "name access created at download" or low == "download":
-      continue
-    if "internal server error" in low:
-      continue
-    seen.add(row)
-    let label = labelPrefix & "[" & $seen.len & "]"
-    result.nodes.add((label, row))
-    result.nodeCount = result.nodes.len
-    finding(label, row)
+  let items = visibleTextItems(body)
+  if "internal server error" in body.toLowerAscii():
+    return
+  appendVisibleItems(result, items, labelPrefix)
 
 proc extractNewVisibleHtmlResponses*(baseline: string,
                                      bodies: seq[string],
@@ -612,24 +785,20 @@ proc extractNewVisibleHtmlResponses*(baseline: string,
     if body.len == 0 or "internal server error" in lowBody:
       continue
 
-    var items = extractHtmlTableRowsDetailed(body)
-    if items.len == 0:
-      items = normalizedLines(body)
-
-    for item in items:
+    var newItems: seq[string]
+    for item in visibleTextItems(body):
       let low = item.toLowerAscii()
       if item.len == 0:
         continue
       if item in seen:
         continue
-      if low == "download" or "internal server error" in low:
+      if "internal server error" in low:
         continue
 
       seen.add(item)
-      let label = labelPrefix & "[" & $(result.nodes.len + 1) & "]"
-      result.nodes.add((label, item))
-      result.nodeCount = result.nodes.len
-      finding(label, item)
+      newItems.add(item)
+
+    appendVisibleItems(result, newItems, labelPrefix)
 
 proc sendVisiblePayload(cfg: ScanConfig, param: string,
                         queryParams: Table[string, string],
@@ -666,7 +835,7 @@ proc extractVisiblePredicatePages*(cfg: ScanConfig, param: string,
     var rows = extractHtmlRows(resp.body)
     if rows.len == 0:
       let text = compactVisibleText(resp.body)
-      if text.len > 0 and "no results" notin text.toLowerAscii():
+      if text.len > 0:
         rows.add(text)
 
     var added = 0
@@ -764,11 +933,20 @@ proc walkVisibleTree(cfg: ScanConfig, param: string,
   if body.len == 0:
     return
 
+  let source = payloadLabel(selector, path)
+  let nodes = visibleDeltaNodes(baselineBody, body, source)
+  if nodes.len > 0:
+    for node in nodes:
+      er.nodes.add(node)
+      er.nodeCount = er.nodes.len
+      finding(node[0], node[1])
+    return
+
   let val = visibleDelta(baselineBody, body)
   if val.len > 0:
-    er.nodes.add((path, val))
+    er.nodes.add((source, val))
     er.nodeCount = er.nodes.len
-    finding(path, val)
+    finding(source, val)
     return
 
   for i in 1..maxSiblings:
@@ -801,13 +979,24 @@ proc extractVisibleNodeSelection*(cfg: ScanConfig, param: string,
   if seedPath.len > 0:
     info("Extracting confirmed visible path: " & seedPath)
     let (_, body) = sendVisiblePath(cfg, param, queryParams, selector, seedPath, reqCount)
+    let source = payloadLabel(selector, seedPath)
+    let nodes = visibleDeltaNodes(baseline.body, body, source)
+    if nodes.len > 0:
+      result.expr = seedPath
+      for node in nodes:
+        result.nodes.add(node)
+        result.nodeCount = result.nodes.len
+        finding(node[0], node[1])
+      result.reqCount = reqCount
+      return
+
     let val = visibleDelta(baseline.body, body)
     if val.len > 0:
       result.expr = seedPath
-      result.nodes.add((seedPath, val))
+      result.nodes.add((source, val))
       result.nodeCount = result.nodes.len
       result.reqCount = reqCount
-      finding(seedPath, val)
+      finding(source, val)
       return
 
     for params in suppressedVisibleParams(queryParams, param):
@@ -815,13 +1004,23 @@ proc extractVisibleNodeSelection*(cfg: ScanConfig, param: string,
       if supBaseline.err.len > 0:
         continue
       let (_, supBody) = sendVisiblePath(cfg, param, params, selector, seedPath, reqCount)
+      let source = payloadLabel(selector, seedPath)
+      let supNodes = visibleDeltaNodes(supBaseline.body, supBody, source)
+      if supNodes.len > 0:
+        result.expr = seedPath
+        for node in supNodes:
+          result.nodes.add(node)
+          result.nodeCount = result.nodes.len
+          finding(node[0], node[1])
+        result.reqCount = reqCount
+        return
       let supVal = visibleDelta(supBaseline.body, supBody)
       if supVal.len > 0:
         result.expr = seedPath
-        result.nodes.add((seedPath, supVal))
+        result.nodes.add((source, supVal))
         result.nodeCount = result.nodes.len
         result.reqCount = reqCount
-        finding(seedPath, supVal)
+        finding(source, supVal)
         return
     warn("Confirmed path did not produce visible data; falling back to tree walk")
 

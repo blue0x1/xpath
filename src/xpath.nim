@@ -67,6 +67,202 @@ proc extractAuthRedirect*(cfg: ScanConfig, vuln: Vulnerability): ExtractionResul
         result.nodes.add(node)
   result.nodeCount = result.nodes.len
 
+proc techniquesText(cfg: ScanConfig): string =
+  var ts: seq[string]
+  if techError in cfg.techniques: ts.add("Error")
+  if techBoolean in cfg.techniques: ts.add("Boolean")
+  if techTime in cfg.techniques: ts.add("Time")
+  if techAuth in cfg.techniques: ts.add("Auth-Bypass")
+  if techUnion in cfg.techniques: ts.add("Union")
+  result = ts.join(" · ")
+
+proc collectUnionVulns(scanResult: ScanResult): seq[Vulnerability] =
+  for v in scanResult.vulns:
+    if v.vulnType == vtUnion:
+      result.add(v)
+
+proc extractionScore(v: Vulnerability): float =
+  let bodyLower = v.responseBody.toLowerAscii()
+  let payloadLower = v.payload.toLowerAscii()
+  let typeScore =
+    case v.vulnType
+    of vtUnion: 130.0
+    of vtAuth:
+      if "internal server error" in bodyLower: 5.0
+      elif "location:" in bodyLower and "login failed" notin bodyLower: 99.0
+      elif "<tr" in bodyLower: 98.0
+      elif "<" in v.responseBody: 96.0
+      else: 30.0
+    of vtBoolean:
+      if "location:" in bodyLower: 40.0
+      elif "<tr" in bodyLower: 88.0
+      elif "position()>" in v.payload: 95.0
+      else: 80.0
+    of vtTime: 40.0
+    of vtError: 10.0
+
+  let payloadScore =
+    if v.vulnType == vtAuth:
+      if "contains" in payloadLower and
+         ("admin" in payloadLower or "root" in payloadLower or "priv" in payloadLower or
+          "owner" in payloadLower or "manager" in payloadLower or
+          "operator" in payloadLower or "staff" in payloadLower): 6.0
+      elif "position()=3" in payloadLower: 4.0
+      elif "position()=2" in payloadLower: 3.0
+      elif "position()=last()" in payloadLower: 2.0
+      else: 0.0
+    else:
+      0.0
+  result = typeScore + payloadScore + v.confidence
+
+proc chooseExtractionVuln(scanResult: ScanResult): Vulnerability =
+  result = scanResult.vulns[0]
+  var bestScore = -1.0
+  let pool =
+    if collectUnionVulns(scanResult).len > 0: collectUnionVulns(scanResult)
+    else: scanResult.vulns
+  for v in pool:
+    let score = extractionScore(v)
+    if score > bestScore:
+      bestScore = score
+      result = v
+
+proc extractionKind(v: Vulnerability): string =
+  case v.vulnType
+  of vtUnion: "visible node-selection"
+  of vtAuth: "visible auth-response"
+  else: "blind"
+
+proc requestParams(cfg: ScanConfig, param, sourceUrl: string): Table[string, string] =
+  if cfg.httpMethod == hmGet:
+    let url = if sourceUrl.len > 0: sourceUrl else: cfg.url
+    result = parseQueryParams(url)
+  else:
+    result = parseFormParams(cfg.data)
+  if result.len == 0:
+    result[param] = ""
+
+proc positiveBodies(scanResult: ScanResult, param: string): seq[string] =
+  for v in scanResult.vulns:
+    if v.parameter == param and v.responseBody.len > 0 and
+       ("<" in v.responseBody or "location:" in v.responseBody.toLowerAscii()):
+      result.add(v.responseBody)
+
+proc confirmedTruePayload(v: Vulnerability): string =
+  let slashPos = v.payload.find(" / ")
+  if slashPos > 0: v.payload[0..<slashPos] else: v.payload
+
+proc unionSeedPath(cfg: ScanConfig, uv: Vulnerability): string =
+  if cfg.extractExpr.len > 0:
+    return cfg.extractExpr
+  let pipePos = uv.payload.find("|")
+  if pipePos > 0:
+    return uv.payload[pipePos + 1 .. ^1]
+  result = ""
+
+proc unionSelector(uv: Vulnerability,
+                   queryParams: Table[string, string]): string =
+  let pipePos = uv.payload.find("|")
+  if pipePos > 0:
+    return uv.payload[0 ..< pipePos]
+  if uv.parameter in queryParams:
+    return queryParams[uv.parameter]
+  result = ""
+
+proc extractUnionData(cfg: ScanConfig,
+                      vulns: seq[Vulnerability],
+                      chosen: Vulnerability,
+                      queryParams: Table[string, string]): ExtractionResult =
+  result = ExtractionResult(expr: "visible union paths")
+  var seenPaths: seq[string]
+  let targets = if cfg.extractExpr.len > 0: @[chosen] else: vulns
+
+  for uv in targets:
+    if uv.parameter != chosen.parameter:
+      continue
+    let seedPath = unionSeedPath(cfg, uv)
+    if seedPath.len == 0 or seedPath in seenPaths:
+      continue
+    seenPaths.add(seedPath)
+
+    let selector = unionSelector(uv, queryParams)
+    let one = extractVisibleNodeSelection(cfg, uv.parameter, queryParams,
+                                          selector, seedPath)
+    result.reqCount += one.reqCount
+    for n in one.nodes:
+      if n notin result.nodes:
+        result.nodes.add(n)
+
+  result.nodeCount = result.nodes.len
+  if cfg.extractExpr.len > 0:
+    result.expr = cfg.extractExpr
+  elif result.nodes.len == 1:
+    result.expr = result.nodes[0][0]
+
+proc runExtraction(cfg: ScanConfig, scanResult: ScanResult): ExtractionResult =
+  if not cfg.extract or scanResult.vulns.len == 0:
+    return
+
+  let vuln = chooseExtractionVuln(scanResult)
+  info("Starting " & extractionKind(vuln) &
+       " data extraction on param: " & vuln.parameter)
+  echo ""
+
+  let queryParams = requestParams(cfg, vuln.parameter, vuln.url)
+  let confirmedTrue = confirmedTruePayload(vuln)
+
+  var extractCfg = cfg
+  extractCfg.url = vuln.url
+  if vuln.responseBody.toLowerAscii().startsWith("http 302"):
+    extractCfg.followRedirects = false
+
+  var baselineBody = ""
+  var positiveHtmlBodies: seq[string]
+  if cfg.extractExpr.len == 0 and vuln.vulnType != vtUnion:
+    let baselineResp = sendRequestWithRetry(extractCfg)
+    if baselineResp.err.len == 0:
+      baselineBody = baselineResp.body
+    positiveHtmlBodies = positiveBodies(scanResult, vuln.parameter)
+
+  case vuln.vulnType
+  of vtUnion:
+    result = extractUnionData(extractCfg, collectUnionVulns(scanResult),
+                              vuln, queryParams)
+  of vtAuth:
+    if cfg.extractExpr.len == 0 and vuln.responseBody.len > 0:
+      if "location:" in vuln.responseBody.toLowerAscii():
+        result = extractAuthRedirect(cfg, vuln)
+      if result.nodes.len == 0:
+        result = extractNewVisibleHtmlResponses(baselineBody, positiveHtmlBodies)
+      if result.nodes.len == 0:
+        result = extractVisibleHtmlResponse(vuln.responseBody)
+    elif cfg.extractExpr.len > 0:
+      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
+      let val = extractExpression(ctx, cfg.extractExpr, cfg)
+      result = ExtractionResult(expr: cfg.extractExpr, value: val, reqCount: ctx.reqCount)
+  of vtBoolean:
+    if cfg.extractExpr.len == 0 and "position()>" in confirmedTrue:
+      if positiveHtmlBodies.len > 0:
+        result = extractNewVisibleHtmlResponses(baselineBody, positiveHtmlBodies)
+      if result.nodes.len == 0:
+        result = extractVisiblePredicatePages(extractCfg, vuln.parameter,
+                                              queryParams, confirmedTrue)
+    elif cfg.extractExpr.len > 0:
+      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
+      let val = extractExpression(ctx, cfg.extractExpr, cfg)
+      result = ExtractionResult(expr: cfg.extractExpr, value: val, reqCount: ctx.reqCount)
+    else:
+      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
+      result = extractAuto(ctx, cfg)
+  else:
+    if cfg.extractExpr.len > 0:
+      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
+      let val = extractExpression(ctx, cfg.extractExpr, cfg)
+      result = ExtractionResult(expr: cfg.extractExpr, value: val, reqCount: ctx.reqCount)
+    else:
+      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
+      result = extractAuto(ctx, cfg)
+
 when isMainModule:
   let cfg = parseCli()
 
@@ -78,14 +274,7 @@ when isMainModule:
     info("Data       : " & cfg.data)
   if cfg.proxy.len > 0:
     info("Proxy      : " & cfg.proxy)
-  info("Techniques : " & (block:
-    var ts: seq[string]
-    if techError   in cfg.techniques: ts.add("Error")
-    if techBoolean in cfg.techniques: ts.add("Boolean")
-    if techTime    in cfg.techniques: ts.add("Time")
-    if techAuth    in cfg.techniques: ts.add("Auth-Bypass")
-    if techUnion   in cfg.techniques: ts.add("Union")
-    ts.join(" · ")))
+  info("Techniques : " & techniquesText(cfg))
   info("Level      : " & $cfg.level)
   echo ""
 
@@ -103,153 +292,7 @@ when isMainModule:
   var extractResult: ExtractionResult
 
   if cfg.extract and scanResult.vulns.len > 0:
-    let unionVulns = block:
-      var items: seq[Vulnerability]
-      for v in scanResult.vulns:
-        if v.vulnType == vtUnion:
-          items.add(v)
-      items
-
-    let vuln = block:
-      var chosen = scanResult.vulns[0]
-      var bestScore = -1.0
-      for v in scanResult.vulns:
-        let bodyLower = v.responseBody.toLowerAscii()
-        let payloadLower = v.payload.toLowerAscii()
-        let typeScore =
-          case v.vulnType
-          of vtUnion: 100.0
-          of vtAuth:
-            if "internal server error" in bodyLower: 5.0
-            elif "location:" in bodyLower and "login failed" notin bodyLower: 99.0
-            elif "<tr" in bodyLower: 98.0
-            elif "<" in v.responseBody: 96.0
-            else: 30.0
-          of vtBoolean:
-            if "location:" in bodyLower: 40.0
-            elif "<tr" in bodyLower: 88.0
-            elif "position()>" in v.payload: 95.0
-            else: 80.0
-          of vtTime: 40.0
-          of vtError: 10.0
-        let payloadScore =
-          if v.vulnType == vtAuth:
-            if "contains" in payloadLower and
-               ("admin" in payloadLower or "root" in payloadLower or "priv" in payloadLower or
-                "owner" in payloadLower or "manager" in payloadLower or
-                "operator" in payloadLower or "staff" in payloadLower): 6.0
-            elif "position()=3" in payloadLower: 4.0
-            elif "position()=2" in payloadLower: 3.0
-            elif "position()=last()" in payloadLower: 2.0
-            else: 0.0
-          else:
-            0.0
-        let score = typeScore + payloadScore + v.confidence
-        if score > bestScore:
-          bestScore = score
-          chosen = v
-      chosen
-
-    let extractKind =
-      if vuln.vulnType == vtUnion: "visible node-selection"
-      elif vuln.vulnType == vtAuth: "visible auth-response"
-      else: "blind"
-    info("Starting " & extractKind & " data extraction on param: " & vuln.parameter)
-    echo ""
-
-    var queryParams: Table[string, string]
-    if cfg.httpMethod == hmGet:
-      queryParams = parseQueryParams(cfg.url)
-    else:
-      queryParams = parseFormParams(cfg.data)
-
-    if queryParams.len == 0:
-      queryParams[vuln.parameter] = ""
-
-    var extractCfg = cfg
-    extractCfg.url = vuln.url   # use the form's action URL
-    if vuln.responseBody.toLowerAscii().startsWith("http 302"):
-      extractCfg.followRedirects = false
-
-    var baselineBody = ""
-    var positiveHtmlBodies: seq[string]
-    if cfg.extractExpr.len == 0 and vuln.vulnType != vtUnion:
-      let baselineResp = sendRequestWithRetry(extractCfg)
-      if baselineResp.err.len == 0:
-        baselineBody = baselineResp.body
-      for v in scanResult.vulns:
-        if v.parameter == vuln.parameter and v.responseBody.len > 0 and
-           ("<" in v.responseBody or "location:" in v.responseBody.toLowerAscii()):
-          positiveHtmlBodies.add(v.responseBody)
-
-    let confirmedTrue = block:
-      let slashPos = vuln.payload.find(" / ")
-      if slashPos > 0: vuln.payload[0..<slashPos]
-      else: vuln.payload
-
-    if vuln.vulnType == vtUnion:
-      extractResult = ExtractionResult(expr: "visible union paths")
-      var seenPaths: seq[string]
-      let targets =
-        if cfg.extractExpr.len > 0: @[vuln]
-        else: unionVulns
-
-      for uv in targets:
-        if uv.parameter != vuln.parameter:
-          continue
-        let seedPath = block:
-          if cfg.extractExpr.len > 0: cfg.extractExpr
-          else:
-            let pipePos = uv.payload.find("|")
-            if pipePos > 0: uv.payload[pipePos+1..^1]
-            else: ""
-        if seedPath.len == 0 or seedPath in seenPaths:
-          continue
-        seenPaths.add(seedPath)
-
-        let selector = block:
-          let pipePos = uv.payload.find("|")
-          if pipePos > 0: uv.payload[0..<pipePos]
-          elif uv.parameter in queryParams: queryParams[uv.parameter]
-          else: ""
-        let one = extractVisibleNodeSelection(extractCfg, uv.parameter,
-                                              queryParams, selector, seedPath)
-        extractResult.reqCount += one.reqCount
-        for n in one.nodes:
-          if n notin extractResult.nodes:
-            extractResult.nodes.add(n)
-      extractResult.nodeCount = extractResult.nodes.len
-      if cfg.extractExpr.len > 0:
-        extractResult.expr = cfg.extractExpr
-      elif extractResult.nodes.len == 1:
-        extractResult.expr = extractResult.nodes[0][0]
-    elif vuln.vulnType == vtAuth and cfg.extractExpr.len == 0 and
-         vuln.responseBody.len > 0:
-      if "location:" in vuln.responseBody.toLowerAscii():
-        extractResult = extractAuthRedirect(cfg, vuln)
-      if extractResult.nodes.len == 0:
-        extractResult = extractNewVisibleHtmlResponses(baselineBody, positiveHtmlBodies)
-      if extractResult.nodes.len == 0:
-        extractResult = extractVisibleHtmlResponse(vuln.responseBody)
-    elif vuln.vulnType == vtBoolean and cfg.extractExpr.len == 0 and
-         "position()>" in confirmedTrue:
-      if positiveHtmlBodies.len > 0:
-        extractResult = extractNewVisibleHtmlResponses(baselineBody, positiveHtmlBodies)
-      if extractResult.nodes.len == 0:
-        extractResult = extractVisiblePredicatePages(extractCfg, vuln.parameter,
-                                                     queryParams, confirmedTrue)
-    elif cfg.extractExpr.len > 0:
-      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
-      let val = extractExpression(ctx, cfg.extractExpr, cfg)
-      extractResult = ExtractionResult(
-        expr:     cfg.extractExpr,
-        value:    val,
-        reqCount: ctx.reqCount
-      )
-    else:
-      var ctx = setupContext(extractCfg, vuln.parameter, queryParams, confirmedTrue)
-      extractResult = extractAuto(ctx, cfg)
-
+    extractResult = runExtraction(cfg, scanResult)
     printExtractionResult(extractResult)
 
   elif cfg.extract and scanResult.vulns.len == 0:

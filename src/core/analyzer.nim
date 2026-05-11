@@ -3,7 +3,7 @@
 ## Licensed under the MIT License.
 ## Legal use only: use on systems you own or have explicit permission to test.
 
-import strutils, math, sets
+import strutils, sets
 import payloads
 
 type

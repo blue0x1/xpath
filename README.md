@@ -1,3 +1,5 @@
+# xpath
+
 <p align="center">
   <img width="1024" height="243" alt="xpath" src="https://github.com/user-attachments/assets/2b6ed396-4048-4b47-8003-921cd53ec0a3" />
 </p>
@@ -53,6 +55,7 @@ This installs the latest package from the official Nim package list.
 git clone https://github.com/blue0x1/xpath.git
 cd xpath
 make linux
+make test
 ```
 
 The Linux binary is written to:
@@ -248,6 +251,7 @@ xpath -u "http://target.local/query?q=test" -p q -x --xpath "name(/*[1])"
 |---|---|
 | `make linux` | `dist/xpath-linux-amd64` |
 | `make windows` | `dist/xpath-windows-amd64.exe` |
+| `make test` | Runs the Nim test suite |
 | `make install` | Installs to `$(PREFIX)/bin/xpath` |
 | `make deb` | `dist/xpath_1.0.0_amd64.deb` |
 | `make clean` | Removes `build/` and `dist/` |

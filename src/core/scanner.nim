@@ -3,7 +3,7 @@
 ## Licensed under the MIT License.
 ## Legal use only: use on systems you own or have explicit permission to test.
 
-import strutils, tables, math, times
+import strutils, tables, times
 import ../utils/config, ../utils/logger
 import http, payloads, analyzer, crawler, extractor
 
@@ -516,12 +516,6 @@ proc scanUnionBased*(cfg: ScanConfig,
         continue
       maybeReportWaf(resp, "union probe")
 
-      let baseLower = ctxInfo.baseline.body.toLowerAscii()
-      let respLower = resp.body.toLowerAscii()
-      if "no results" in respLower and "no results" notin baseLower:
-        debug("    skip " & payload & " because it only removed visible results")
-        continue
-
       let visibleNew = visibleDelta(ctxInfo.baseline.body, resp.body)
       if visibleNew.len == 0:
         debug("    skip " & payload & " because response change has no new visible data")
@@ -570,10 +564,40 @@ proc normalizedFormDefaults(form: DetectedForm): DetectedForm =
     case result.fields[i].kind
     of fkText, fkPassword, fkSearch, fkTextarea:
       result.fields[i].value = "xpathscan"
-    of fkSelect:
+    of fkSelect, fkRadio, fkCheckbox:
       result.fields[i].value = "1"
     else:
       discard
+
+proc formParamTable(form: DetectedForm): Table[string, string] =
+  let prepared = normalizedFormDefaults(form)
+  let encoded =
+    if prepared.httpMethod == hmPost:
+      formToPostBody(prepared, "", "")
+    else:
+      let url = formToGetUrl(prepared, "", "")
+      let q = url.find('?')
+      if q >= 0: url[q + 1 .. ^1] else: ""
+  result = parseFormParams(encoded)
+
+proc scanFormUnionBased(cfg: ScanConfig,
+                        form: DetectedForm,
+                        field: FormField,
+                        baseline: HttpResponse,
+                        reqCount: var int): seq[Vulnerability] =
+  var formCfg = cfg
+  formCfg.httpMethod = form.httpMethod
+  formCfg.followRedirects = false
+
+  let prepared = normalizedFormDefaults(form)
+  if form.httpMethod == hmPost:
+    formCfg.url = form.action
+    formCfg.data = formToPostBody(prepared, "", "")
+  else:
+    formCfg.url = formToGetUrl(prepared, "", "")
+
+  let params = formParamTable(prepared)
+  result = scanUnionBased(formCfg, field.name, params, baseline, reqCount)
 
 proc sendFormRequest(cfg: ScanConfig,
                      form: DetectedForm,
@@ -861,7 +885,10 @@ proc scanForm*(cfg: ScanConfig,
   info("  Baseline: HTTP " & $baseline.statusCode &
        " | " & $baseline.body.len & " bytes")
 
-  let testableKinds = {fkText, fkPassword, fkHidden, fkSearch, fkTextarea, fkSelect}
+  let testableKinds = {
+    fkText, fkPassword, fkHidden, fkSearch, fkTextarea,
+    fkSelect, fkRadio, fkCheckbox
+  }
   var testedAny = false
   for field in form.fields:
     if field.kind notin testableKinds: continue
@@ -870,6 +897,8 @@ proc scanForm*(cfg: ScanConfig,
       of fkHidden:   " (hidden)"
       of fkPassword: " (password)"
       of fkSelect:   " (select)"
+      of fkRadio:    " (radio)"
+      of fkCheckbox: " (checkbox)"
       of fkTextarea: " (textarea)"
       else: ""
     info("  Testing field: [" & field.name & "]" & kindTag)
@@ -885,6 +914,10 @@ proc scanForm*(cfg: ScanConfig,
     if techBoolean in cfg.techniques:
       result.vulns.add(
         scanFormBooleanBased(cfg, form, field, baseline, result.requestCount))
+
+    if techUnion in cfg.techniques:
+      result.vulns.add(
+        scanFormUnionBased(cfg, form, field, baseline, result.requestCount))
 
     if techTime in cfg.techniques:
       result.vulns.add(
