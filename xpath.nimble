@@ -9,6 +9,7 @@ description   = "Advanced XPath Injection Vulnerability Scanner"
 license       = "MIT"
 srcDir        = "src"
 bin           = @["xpath"]
+switch("define", "ssl")
 
 # Dependencies
 requires "nim >= 2.0.0"
