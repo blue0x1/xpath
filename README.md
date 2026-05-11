@@ -45,6 +45,25 @@ Or with nimble:
 nimble build -d:ssl
 ```
 
+Or with make:
+
+```sh
+# Linux binary: dist/xpath-linux-amd64
+make linux
+
+# Windows binary: dist/xpath-windows-amd64.exe
+make windows
+
+# Install to /usr/local/bin/xpath
+sudo make install
+
+# Build Debian package: dist/xpath_1.0.0_amd64.deb
+make deb
+
+# Remove generated build artifacts
+make clean
+```
+
 ## Usage
 
 ```
