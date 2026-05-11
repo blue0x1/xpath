@@ -13,6 +13,7 @@ BUILD_DIR := build
 DIST_DIR := dist
 NIMCACHE := $(BUILD_DIR)/nimcache
 NIMFLAGS := -d:ssl -d:release --nimcache:$(NIMCACHE)
+MINGW_CC ?= x86_64-w64-mingw32-gcc
 LINUX_BIN := $(DIST_DIR)/$(APP)-linux-$(ARCH)
 WINDOWS_BIN := $(DIST_DIR)/$(APP)-windows-$(ARCH).exe
 DEB_ROOT := $(BUILD_DIR)/deb/$(APP)_$(VERSION)_$(ARCH)
@@ -32,7 +33,8 @@ linux: $(DIST_DIR) $(BUILD_DIR)
 	nim c $(NIMFLAGS) -o:$(LINUX_BIN) $(SRC)
 
 windows: $(DIST_DIR) $(BUILD_DIR)
-	nim c $(NIMFLAGS) --os:windows --cpu:amd64 -o:$(WINDOWS_BIN) $(SRC)
+	@command -v $(MINGW_CC) >/dev/null 2>&1 || { echo "Missing Windows cross compiler: $(MINGW_CC)"; echo "Install mingw-w64 or set MINGW_CC=/path/to/x86_64-w64-mingw32-gcc"; exit 1; }
+	nim c $(NIMFLAGS) --os:windows --cpu:amd64 --cc:gcc --gcc.exe:$(MINGW_CC) --gcc.linkerexe:$(MINGW_CC) -o:$(WINDOWS_BIN) $(SRC)
 
 install: linux
 	install -Dm755 $(LINUX_BIN) $(DESTDIR)$(BINDIR)/$(APP)
@@ -57,7 +59,7 @@ deb: linux
 		'Maintainer: Chokri Hammedi (blue0x1)' \
 		'Description: Advanced XPath injection scanner for authorized security testing' \
 		> $(DEB_ROOT)/DEBIAN/control
-	dpkg-deb --build $(DEB_ROOT) $(DEB_FILE)
+	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_FILE)
 
 clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR)

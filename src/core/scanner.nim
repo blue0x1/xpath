@@ -9,8 +9,13 @@ import http, payloads, analyzer, crawler, extractor
 
 var gWafNoticeShown = false
 
+proc isWafStatus(code: int): bool =
+  code == 401 or code == 403 or code == 406 or code == 407 or
+  code == 409 or code == 412 or code == 418 or code == 429 or
+  code == 501 or code == 503
+
 proc wafEvidence(resp: HttpResponse): seq[string] =
-  if resp.statusCode in {401, 403, 406, 407, 409, 412, 418, 429, 501, 503}:
+  if isWafStatus(resp.statusCode):
     result.add("HTTP " & $resp.statusCode)
   for k, v in resp.headers:
     let key = k.toLowerAscii()
