@@ -7,7 +7,7 @@
 ## Parses raw HTML to extract <form> elements and their fields,
 ## resolves relative action URLs, and returns ready-to-scan targets.
 
-import strutils, uri, htmlparser, xmltree, strtabs
+import strutils, uri
 import ../utils/config, ../utils/logger
 
 type
@@ -25,22 +25,6 @@ type
     httpMethod*: HttpMethodKind
     fields*:     seq[FormField]
     raw*:        string
-
-
-proc attrValue(node: XmlNode, name: string): string =
-  result = node.attr(name)
-
-proc hasAttribute(node: XmlNode, name: string): bool =
-  node.kind == xnElement and node.attrs != nil and node.attrs.hasKey(name)
-
-proc nodeText(node: XmlNode): string =
-  case node.kind
-  of xnText, xnVerbatimText, xnCData, xnEntity:
-    result.add(node.text)
-  else:
-    for child in node.items:
-      result.add(nodeText(child))
-
 
 proc resolveUrl*(base, href: string): string =
   if href.len == 0:
@@ -77,69 +61,229 @@ proc fieldKindOf(typeAttr: string): FieldKind =
      "file":            fkOther
   else:                 fkOther
 
-proc selectedValue(selectNode: XmlNode): string =
+proc decodeHtml(s: string): string =
+  result = s
+    .replace("&nbsp;", " ")
+    .replace("&lt;", "<")
+    .replace("&gt;", ">")
+    .replace("&amp;", "&")
+    .replace("&quot;", "\"")
+    .replace("&#39;", "'")
+    .replace("&#039;", "'")
+
+proc findTagEnd(html: string, start: int): int =
+  var quote = '\0'
+  var i = start
+  while i < html.len:
+    let ch = html[i]
+    if quote != '\0':
+      if ch == quote:
+        quote = '\0'
+    elif ch == '"' or ch == '\'':
+      quote = ch
+    elif ch == '>':
+      return i
+    inc i
+  result = -1
+
+proc tagName(tag: string): string =
+  var i = 0
+  while i < tag.len and tag[i] in {'<', '/', ' ', '\t', '\r', '\n'}:
+    inc i
+  let start = i
+  while i < tag.len and tag[i] notin {' ', '\t', '\r', '\n', '/', '>'}:
+    inc i
+  if i > start:
+    result = tag[start ..< i].toLowerAscii()
+
+proc parseAttrs(tag: string): seq[(string, string)] =
+  var i = 0
+  while i < tag.len and tag[i] != '<':
+    inc i
+  if i < tag.len:
+    inc i
+  while i < tag.len and tag[i] in {'/', ' ', '\t', '\r', '\n'}:
+    inc i
+  while i < tag.len and tag[i] notin {' ', '\t', '\r', '\n', '/', '>'}:
+    inc i
+
+  while i < tag.len:
+    while i < tag.len and tag[i] in {' ', '\t', '\r', '\n', '/', '>'}:
+      inc i
+    if i >= tag.len:
+      break
+
+    let nameStart = i
+    while i < tag.len and tag[i] notin {' ', '\t', '\r', '\n', '=', '/', '>'}:
+      inc i
+    if i <= nameStart:
+      break
+    let name = tag[nameStart ..< i].toLowerAscii()
+
+    while i < tag.len and tag[i] in {' ', '\t', '\r', '\n'}:
+      inc i
+
+    var value = ""
+    if i < tag.len and tag[i] == '=':
+      inc i
+      while i < tag.len and tag[i] in {' ', '\t', '\r', '\n'}:
+        inc i
+      if i < tag.len and (tag[i] == '"' or tag[i] == '\''):
+        let quote = tag[i]
+        inc i
+        let valueStart = i
+        while i < tag.len and tag[i] != quote:
+          inc i
+        value = tag[valueStart ..< min(i, tag.len)].decodeHtml()
+        if i < tag.len:
+          inc i
+      else:
+        let valueStart = i
+        while i < tag.len and tag[i] notin {' ', '\t', '\r', '\n', '/', '>'}:
+          inc i
+        value = tag[valueStart ..< i].decodeHtml()
+
+    result.add((name, value))
+
+proc attrValue(attrs: seq[(string, string)], name: string): string =
+  let target = name.toLowerAscii()
+  for (k, v) in attrs:
+    if k == target:
+      return v
+  result = ""
+
+proc hasAttribute(attrs: seq[(string, string)], name: string): bool =
+  let target = name.toLowerAscii()
+  for (k, _) in attrs:
+    if k == target:
+      return true
+  result = false
+
+proc selectedValue(selectHtml: string): string =
+  let low = selectHtml.toLowerAscii()
+  var pos = 0
   var firstValue = ""
-  for option in selectNode.findAll("option", caseInsensitive = true):
-    let value = block:
-      let attr = option.attrValue("value")
-      if attr.len > 0: attr else: option.nodeText().strip()
+  while true:
+    let start = low.find("<option", pos)
+    if start < 0:
+      break
+    let gt = findTagEnd(selectHtml, start)
+    if gt < 0:
+      break
+    let tag = selectHtml[start .. gt]
+    let attrs = parseAttrs(tag)
+    let closeStart = low.find("</option>", gt + 1)
+    let text =
+      if closeStart >= 0: selectHtml[gt + 1 ..< closeStart].decodeHtml().strip()
+      else: ""
+    let attr = attrs.attrValue("value")
+    let value = if attr.len > 0: attr else: text
     if firstValue.len == 0:
       firstValue = value
-    if option.hasAttribute("selected"):
+    if attrs.hasAttribute("selected"):
       return value
+    pos = if closeStart >= 0: closeStart + 9 else: gt + 1
   result = firstValue
 
-proc formFieldNodes(formNode: XmlNode): seq[XmlNode] =
-  for child in formNode.findAll("input", caseInsensitive = true):
-    result.add(child)
-  for child in formNode.findAll("textarea", caseInsensitive = true):
-    result.add(child)
-  for child in formNode.findAll("select", caseInsensitive = true):
-    result.add(child)
+proc plainText(html: string): string =
+  var inTag = false
+  for ch in html:
+    case ch
+    of '<': inTag = true
+    of '>':
+      inTag = false
+      result.add(' ')
+    else:
+      if not inTag:
+        result.add(ch)
+  result = result.decodeHtml().strip()
+
+proc addFieldsFromForm(formHtml: string, form: var DetectedForm) =
+  let low = formHtml.toLowerAscii()
+  var pos = 0
+  while true:
+    let start = low.find("<", pos)
+    if start < 0:
+      break
+    let gt = findTagEnd(formHtml, start)
+    if gt < 0:
+      break
+    let tag = formHtml[start .. gt]
+    let name = tagName(tag)
+    let attrs = parseAttrs(tag)
+
+    case name
+    of "input":
+      let fieldName = attrs.attrValue("name")
+      if fieldName.len > 0:
+        let kind = fieldKindOf(attrs.attrValue("type"))
+        if kind != fkOther:
+          form.fields.add(FormField(
+            name: fieldName,
+            kind: kind,
+            value: attrs.attrValue("value")
+          ))
+      pos = gt + 1
+    of "textarea":
+      let closeStart = low.find("</textarea>", gt + 1)
+      let content =
+        if closeStart >= 0: formHtml[gt + 1 ..< closeStart].plainText()
+        else: ""
+      let fieldName = attrs.attrValue("name")
+      if fieldName.len > 0:
+        form.fields.add(FormField(
+          name: fieldName,
+          kind: fkTextarea,
+          value: content
+        ))
+      pos = if closeStart >= 0: closeStart + 11 else: gt + 1
+    of "select":
+      let closeStart = low.find("</select>", gt + 1)
+      let content =
+        if closeStart >= 0: formHtml[start ..< closeStart + 9]
+        else: tag
+      let fieldName = attrs.attrValue("name")
+      if fieldName.len > 0:
+        form.fields.add(FormField(
+          name: fieldName,
+          kind: fkSelect,
+          value: selectedValue(content)
+        ))
+      pos = if closeStart >= 0: closeStart + 9 else: gt + 1
+    else:
+      pos = gt + 1
 
 proc crawlForms*(html, pageUrl: string): seq[DetectedForm] =
-  let doc = parseHtml(html)
-  for formNode in doc.findAll("form", caseInsensitive = true):
-    let action = formNode.attrValue("action")
-    let meth = formNode.attrValue("method").toUpperAscii()
+  let low = html.toLowerAscii()
+  var pos = 0
+  while true:
+    let start = low.find("<form", pos)
+    if start < 0:
+      break
+    let gt = findTagEnd(html, start)
+    if gt < 0:
+      break
+    let closeStart = low.find("</form>", gt + 1)
+    if closeStart < 0:
+      break
+
+    let formTag = html[start .. gt]
+    let attrs = parseAttrs(formTag)
+    let formHtml = html[gt + 1 ..< closeStart]
+    let action = attrs.attrValue("action")
+    let meth = attrs.attrValue("method").toUpperAscii()
     var form = DetectedForm(
       action: resolveUrl(pageUrl, action),
       httpMethod: if meth == "POST": hmPost else: hmGet,
-      raw: $formNode
+      raw: html[start ..< closeStart + 7]
     )
 
-    for fieldNode in formNode.formFieldNodes():
-      let name = fieldNode.attrValue("name")
-      if name.len == 0:
-        continue
-
-      case fieldNode.tag.toLowerAscii()
-      of "input":
-        let kind = fieldKindOf(fieldNode.attrValue("type"))
-        if kind == fkOther:
-          continue
-        form.fields.add(FormField(
-          name: name,
-          kind: kind,
-          value: fieldNode.attrValue("value")
-        ))
-      of "textarea":
-        form.fields.add(FormField(
-          name: name,
-          kind: fkTextarea,
-          value: fieldNode.nodeText()
-        ))
-      of "select":
-        form.fields.add(FormField(
-          name: name,
-          kind: fkSelect,
-          value: fieldNode.selectedValue()
-        ))
-      else:
-        discard
+    addFieldsFromForm(formHtml, form)
 
     if form.fields.len > 0:
       result.add(form)
+
+    pos = closeStart + 7
 
 proc printForms*(forms: seq[DetectedForm]) =
   if forms.len == 0:
