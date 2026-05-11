@@ -1,3 +1,5 @@
+# xpath
+
 <p align="center">
   <img width="1024" height="243" alt="xpath" src="https://github.com/user-attachments/assets/2b6ed396-4048-4b47-8003-921cd53ec0a3" />
 </p>
@@ -38,6 +40,14 @@ It has no external runtime dependencies beyond the Nim standard library.
 | Transport | Cookies, headers, proxy, retry, timeout, User-Agent, redirect controls |
 
 ## Installation
+
+### Nimble
+
+```bash
+nimble install xpath
+```
+
+This installs the latest package from the official Nim package list.
 
 ### Build From Source
 
