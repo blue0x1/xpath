@@ -1,8 +1,8 @@
 # XPath - Advanced XPath Injection Scanner
 
-Coded by Chokri Hammedi (blue0x1).
-Licensed under the MIT License.
-Legal use only: use on systems you own or have explicit permission to test.
+Coded by Chokri Hammedi (blue0x1). <br>
+Licensed under the MIT License. <br>
+Legal use only: use on systems you own or have explicit permission to test. <br>
 
 A fast, multi-technique XPath injection vulnerability scanner written in Nim.
 Zero external dependencies beyond the Nim standard library.
