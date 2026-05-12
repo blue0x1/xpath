@@ -23,6 +23,25 @@ proc tlsContext(): SslContext =
     sharedSslContext = newContext(verifyMode = CVerifyNone)
   result = sharedSslContext
 
+proc freshTlsContext(): SslContext =
+  newContext(verifyMode = CVerifyNone)
+
+proc isTlsResetError*(err: string): bool =
+  let low = err.toLowerAscii()
+  result =
+    "bio layer" in low or
+    "connection reset by peer" in low or
+    "ssl" in low or
+    "tls" in low or
+    "handshake" in low or
+    "wrong version number" in low
+
+proc httpFallbackUrl(url: string): string =
+  if url.toLowerAscii().startsWith("https://"):
+    result = "http://" & url[8 .. ^1]
+  else:
+    result = ""
+
 proc enforceDelay(cfg: ScanConfig) =
   if cfg.delay <= 0:
     return
@@ -81,14 +100,15 @@ proc encodeFormParams*(params: Table[string, string]): string =
 proc sendRequest*(cfg: ScanConfig,
                   urlOverride: string = "",
                   bodyOverride: string = "",
-                  extraHeaders: seq[(string, string)] = @[]): HttpResponse =
+                  extraHeaders: seq[(string, string)] = @[],
+                  useFreshTls: bool = false): HttpResponse =
   let targetUrl = if urlOverride.len > 0: urlOverride else: cfg.url
 
   enforceDelay(cfg)
 
   var client: HttpClient
   try:
-    let tlsCtx = tlsContext()
+    let tlsCtx = if useFreshTls: freshTlsContext() else: tlsContext()
     let redirects = if cfg.followRedirects: 5 else: 0
     if cfg.proxy.len > 0:
       client = newHttpClient(
@@ -162,6 +182,7 @@ proc sendRequestWithRetry*(cfg: ScanConfig,
                            urlOverride: string = "",
                            bodyOverride: string = "",
                            extraHeaders: seq[(string, string)] = @[]): HttpResponse =
+  let targetUrl = if urlOverride.len > 0: urlOverride else: cfg.url
   for attempt in 0 ..< max(1, cfg.retries):
     result = sendRequest(cfg, urlOverride, bodyOverride, extraHeaders)
     if result.err.len == 0:
@@ -169,6 +190,22 @@ proc sendRequestWithRetry*(cfg: ScanConfig,
     if attempt < cfg.retries - 1:
       debug("Retry " & $(attempt+2) & "/" & $cfg.retries & " after error: " & result.err)
       os.sleep(500 * (attempt + 1))
+
+  if isTlsResetError(result.err):
+    debug("Retrying with a fresh TLS context after transport error: " & result.err)
+    let freshResp = sendRequest(cfg, urlOverride, bodyOverride, extraHeaders, useFreshTls = true)
+    if freshResp.err.len == 0:
+      return freshResp
+    result = freshResp
+
+    let fallback = httpFallbackUrl(targetUrl)
+    if fallback.len > 0 and cfg.proxy.len == 0:
+      debug("TLS connection reset; trying plain HTTP fallback: " & fallback)
+      var fallbackCfg = cfg
+      fallbackCfg.url = fallback
+      result = sendRequest(fallbackCfg, fallback, bodyOverride, extraHeaders)
+      if result.err.len == 0:
+        return
 
 proc injectParam*(baseUrl: string,
                   paramName: string,
