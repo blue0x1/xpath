@@ -256,7 +256,7 @@ xpath -u "http://target.local/query?q=test" -p q -x --xpath "name(/*[1])"
 | `make deb` | `dist/xpath_1.0.0_amd64.deb` |
 | `make clean` | Removes `build/` and `dist/` |
 
-## Project Layout
+## Project Layout 
 
 ```text
 src/
